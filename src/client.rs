@@ -135,6 +135,9 @@
 //! [`Builder`]: struct.Builder.html
 //! [`Error`]: ../struct.Error.html
 
+#[cfg(feature = "sans-io")]
+pub mod sans_io;
+
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};

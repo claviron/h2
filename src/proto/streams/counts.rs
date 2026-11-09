@@ -146,6 +146,11 @@ impl Counts {
         }
     }
 
+    #[cfg(feature = "sans-io")]
+    pub fn available_send_streams(&self) -> usize {
+        self.max_send_streams.saturating_sub(self.num_send_streams)
+    }
+
     /// Returns true when the next opened stream will reach capacity of outbound streams
     ///
     /// The number of client send streams is incremented in prioritize; send_request has to guess if

@@ -1,6 +1,10 @@
+mod decode;
+pub(crate) mod encode;
 mod error;
 mod framed_read;
 mod framed_write;
+#[cfg(feature = "sans-io")]
+pub(crate) mod raw;
 
 pub use self::error::{SendError, UserError};
 
@@ -208,5 +212,65 @@ where
 {
     fn from(src: T) -> Self {
         Self::new(src)
+    }
+}
+
+/// Frame progress supplied either by an asynchronous I/O adapter or by a caller
+/// providing input and consuming output. The protocol engine owns no socket.
+pub(crate) trait FrameIo<B>: Stream<Item = Result<Frame, Error>> + Unpin {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn has_send_capacity(&mut self) -> bool;
+    fn buffer(&mut self, frame: Frame<B>) -> Result<(), UserError>;
+    fn flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn max_send_frame_size(&self) -> usize;
+    fn set_max_send_frame_size(&mut self, value: usize);
+    fn set_max_recv_frame_size(&mut self, value: usize);
+    fn set_send_header_table_size(&mut self, value: usize);
+    fn set_recv_header_table_size(&mut self, value: usize);
+    fn set_max_recv_header_list_size(&mut self, value: usize);
+    fn take_last_data_frame(&mut self) -> Option<Data<B>>;
+}
+
+impl<T, B> FrameIo<B> for Codec<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Codec::poll_ready(self, cx)
+    }
+    fn has_send_capacity(&mut self) -> bool {
+        Codec::has_send_capacity(self)
+    }
+    fn buffer(&mut self, frame: Frame<B>) -> Result<(), UserError> {
+        Codec::buffer(self, frame)
+    }
+    fn flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Codec::flush(self, cx)
+    }
+    fn shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Codec::shutdown(self, cx)
+    }
+    fn max_send_frame_size(&self) -> usize {
+        Codec::max_send_frame_size(self)
+    }
+    fn set_max_send_frame_size(&mut self, value: usize) {
+        Codec::set_max_send_frame_size(self, value)
+    }
+    fn set_max_recv_frame_size(&mut self, value: usize) {
+        Codec::set_max_recv_frame_size(self, value)
+    }
+    fn set_send_header_table_size(&mut self, value: usize) {
+        Codec::set_send_header_table_size(self, value)
+    }
+    fn set_recv_header_table_size(&mut self, value: usize) {
+        Codec::set_recv_header_table_size(self, value)
+    }
+    fn set_max_recv_header_list_size(&mut self, value: usize) {
+        Codec::set_max_recv_header_list_size(self, value)
+    }
+    fn take_last_data_frame(&mut self) -> Option<Data<B>> {
+        Codec::take_last_data_frame(self)
     }
 }

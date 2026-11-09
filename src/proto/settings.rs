@@ -28,6 +28,11 @@ enum Local {
 }
 
 impl Settings {
+    #[cfg(feature = "sans-io")]
+    pub(crate) fn received_initial(&self) -> bool {
+        self.has_received_remote_initial_settings
+    }
+
     pub(crate) fn new(local: frame::Settings) -> Self {
         Settings {
             // We assume the initial local SETTINGS were flushed during
@@ -41,11 +46,11 @@ impl Settings {
     pub(crate) fn recv_settings<T, B, C, P>(
         &mut self,
         frame: frame::Settings,
-        codec: &mut Codec<T, B>,
+        codec: &mut T,
         streams: &mut Streams<C, P>,
     ) -> Result<(), Error>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<B>,
         B: Buf,
         C: Buf,
         P: Peer,
@@ -111,11 +116,11 @@ impl Settings {
     pub(crate) fn poll_send<T, B, C, P>(
         &mut self,
         cx: &mut Context,
-        dst: &mut Codec<T, B>,
+        dst: &mut T,
         streams: &mut Streams<C, P>,
     ) -> Poll<Result<(), Error>>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<B>,
         B: Buf,
         C: Buf,
         P: Peer,

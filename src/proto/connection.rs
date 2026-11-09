@@ -5,23 +5,22 @@ use crate::{client, server};
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
 
+use crate::codec::FrameIo;
 use bytes::Bytes;
-use futures_core::Stream;
 use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::AsyncRead;
 
 /// An H2 connection
 #[derive(Debug)]
-pub(crate) struct Connection<T, P, B: Buf = Bytes>
+pub(crate) struct Core<C, P, B: Buf = Bytes>
 where
     P: Peer,
 {
     /// Read / write frame values
-    codec: Codec<T, Prioritized<B>>,
+    codec: C,
 
     inner: ConnectionInner<P, B>,
 }
@@ -125,13 +124,13 @@ enum State {
     Closed(Reason, Initiator),
 }
 
-impl<T, P, B> Connection<T, P, B>
+impl<C, P, B> Core<C, P, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    C: FrameIo<Prioritized<B>>,
     P: Peer,
     B: Buf,
 {
-    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+    pub fn new(codec: C, config: Config) -> Self {
         fn streams_config(config: &Config) -> streams::Config {
             streams::Config {
                 initial_max_send_streams: config.initial_max_send_streams,
@@ -157,7 +156,7 @@ where
         let streams = Streams::new(streams_config(&config));
         let span = tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         span.follows_from(tracing::Span::current());
-        Connection {
+        Core {
             codec,
             inner: ConnectionInner {
                 state: State::Open,
@@ -171,6 +170,16 @@ where
                 _phantom: PhantomData,
             },
         }
+    }
+
+    #[cfg(feature = "sans-io")]
+    pub(crate) fn codec_mut(&mut self) -> &mut C {
+        &mut self.codec
+    }
+
+    #[cfg(feature = "sans-io")]
+    pub(crate) fn received_settings(&self) -> bool {
+        self.inner.settings.received_initial()
     }
 
     /// connection flow control
@@ -633,9 +642,9 @@ enum ReceivedFrame {
     Done,
 }
 
-impl<T, B> Connection<T, client::Peer, B>
+impl<C, B> Core<C, client::Peer, B>
 where
-    T: AsyncRead + AsyncWrite,
+    C: FrameIo<Prioritized<B>>,
     B: Buf,
 {
     pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
@@ -643,9 +652,9 @@ where
     }
 }
 
-impl<T, B> Connection<T, server::Peer, B>
+impl<C, B> Core<C, server::Peer, B>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    C: FrameIo<Prioritized<B>>,
     B: Buf,
 {
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
@@ -678,7 +687,7 @@ where
     }
 }
 
-impl<T, P, B> Drop for Connection<T, P, B>
+impl<C, P, B> Drop for Core<C, P, B>
 where
     P: Peer,
     B: Buf,
@@ -688,6 +697,8 @@ where
         let _ = self.inner.streams.recv_eof(true);
     }
 }
+
+pub(crate) type Connection<T, P, B = Bytes> = Core<Codec<T, Prioritized<B>>, P, B>;
 
 #[cfg(test)]
 mod tests {

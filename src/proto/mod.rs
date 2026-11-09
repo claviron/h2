@@ -1,4 +1,4 @@
-mod connection;
+pub(crate) mod connection;
 mod error;
 mod go_away;
 mod peer;
@@ -13,7 +13,7 @@ pub(crate) use self::ping_pong::UserPings;
 pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
 pub(crate) use self::streams::{Open, PollReset, Prioritized};
 
-use crate::codec::Codec;
+use crate::codec::{Codec, FrameIo};
 
 use self::go_away::GoAway;
 use self::ping_pong::PingPong;
@@ -22,8 +22,6 @@ use self::settings::Settings;
 use crate::frame::{self, Frame};
 
 use bytes::Buf;
-
-use tokio::io::AsyncWrite;
 
 pub type PingPayload = [u8; 8];
 

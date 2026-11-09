@@ -11,7 +11,7 @@ authors = [
 ]
 description = "An HTTP/2 client and server"
 documentation = "https://docs.rs/h2"
-repository = "https://github.com/hyperium/h2"
+repository = "https://github.com/claviron/h2"
 readme = "README.md"
 keywords = ["http", "async", "non-blocking"]
 categories = ["asynchronous", "web-programming", "network-programming"]
@@ -20,6 +20,8 @@ edition = "2021"
 rust-version = "1.63"
 
 [features]
+# Buffer-driven client API, independent of a socket or async executor.
+sans-io = []
 # Enables `futures::Stream` implementations for various types.
 stream = []
 

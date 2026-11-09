@@ -1,7 +1,7 @@
 use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, BufferStatus, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
-use crate::codec::{Codec, SendError, UserError};
+use crate::codec::{FrameIo, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{self, Frame, Reason};
 use crate::proto::{peer, Error, Initiator, Open, Peer, WindowSize};
@@ -10,7 +10,6 @@ use crate::{client, proto, server};
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Request, Response};
 use std::task::{Context, Poll, Waker};
-use tokio::io::AsyncWrite;
 
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
@@ -128,6 +127,15 @@ where
         }
     }
 
+    #[cfg(feature = "sans-io")]
+    pub fn send_window(&self) -> (usize, usize) {
+        let me = self.inner.lock().unwrap();
+        (
+            me.counts.max_send_streams(),
+            me.counts.available_send_streams(),
+        )
+    }
+
     pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> Result<(), Reason> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
@@ -178,6 +186,11 @@ where
         Ok(())
     }
 
+    #[cfg(feature = "sans-io")]
+    pub fn set_time(&mut self, now: std::time::Instant) {
+        self.inner.lock().unwrap().actions.recv.set_time(now);
+    }
+
     pub fn clear_expired_reset_streams(&mut self) {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
@@ -186,13 +199,9 @@ where
             .clear_expired_reset_streams(&mut me.store, &mut me.counts);
     }
 
-    pub fn poll_complete<T>(
-        &mut self,
-        cx: &mut Context,
-        dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
+    pub fn poll_complete<T>(&mut self, cx: &mut Context, dst: &mut T) -> Poll<io::Result<()>>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<Prioritized<B>>,
     {
         loop {
             // Make any required socket progress before taking stream locks.
@@ -973,10 +982,10 @@ impl Inner {
     fn buffer_pending<T, B>(
         &mut self,
         send_buffer: &SendBuffer<B>,
-        dst: &mut Codec<T, Prioritized<B>>,
+        dst: &mut T,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         let mut send_buffer = send_buffer.inner.lock().unwrap();
@@ -1008,12 +1017,9 @@ impl Inner {
         Ok(BufferStatus::Complete)
     }
 
-    fn reclaim_written_frame<T, B>(
-        &mut self,
-        send_buffer: &SendBuffer<B>,
-        dst: &mut Codec<T, Prioritized<B>>,
-    ) -> bool
+    fn reclaim_written_frame<T, B>(&mut self, send_buffer: &SendBuffer<B>, dst: &mut T) -> bool
     where
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         let mut send_buffer = send_buffer.inner.lock().unwrap();

@@ -56,3 +56,21 @@ fn main() {
 **Is this an embedded Java SQL database engine?**
 
 [No](https://www.h2database.com).
+
+## Buffer-driven client (development)
+
+The `sans-io` feature exposes `client::sans_io::Session`. The caller supplies
+input bytes and monotonic time, drains borrowed output segments, and handles
+response events. No socket, executor, or timer is created. The async client and
+server continue to use the same framing, HPACK and protocol state machine.
+
+Call `drive(now)` after input, output progress or a protocol operation. Drain
+`next_event()` before waiting for transport readiness. `Data` events retain
+receive-window credit until `release_capacity` is called. Request deadlines are
+the caller's responsibility: `reset(stream, Reason::CANCEL)` affects that stream
+alone. `close` queues GOAWAY; keep driving and draining output until complete.
+Server push is disabled by this client API. Stream ownership still uses the
+existing synchronized store; this is not an allocation-free implementation.
+
+This feature is an experimental fork extension, not part of the published
+upstream release. It is intended for readiness-driven clients such as Mio.

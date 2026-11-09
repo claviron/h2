@@ -1,4 +1,5 @@
 use super::*;
+use crate::codec::FrameIo;
 use crate::codec::UserError;
 use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
 use crate::proto;
@@ -47,6 +48,9 @@ pub(super) struct Recv {
 
     /// How long locally reset streams should ignore received frames
     reset_duration: Duration,
+
+    #[cfg(feature = "sans-io")]
+    now: Option<Instant>,
 
     /// Holds frames that are waiting to be read
     buffer: Buffer<Event>,
@@ -107,6 +111,8 @@ impl Recv {
             pending_accept: store::Queue::new(),
             pending_reset_expired: store::Queue::new(),
             reset_duration: config.local_reset_duration,
+            #[cfg(feature = "sans-io")]
+            now: None,
             buffer: Buffer::new(),
             is_push_enabled: config.local_push_enabled,
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
@@ -1027,6 +1033,19 @@ impl Recv {
     }
 
     /// Add a locally reset stream to queue to be eventually reaped.
+    #[cfg(feature = "sans-io")]
+    pub fn set_time(&mut self, now: Instant) {
+        self.now = Some(now);
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(feature = "sans-io")]
+        if let Some(now) = self.now {
+            return now;
+        }
+        Instant::now()
+    }
+
     pub fn enqueue_reset_expiration(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
         if !stream.state.is_local_error() || stream.is_pending_reset_expiration() {
             return;
@@ -1036,6 +1055,7 @@ impl Recv {
             counts.inc_num_reset_streams();
             tracing::trace!("enqueue_reset_expiration; added {:?}", stream.id);
             self.pending_reset_expired.push(stream);
+            stream.reset_at = Some(self.now());
         } else {
             tracing::trace!(
                 "enqueue_reset_expiration; dropped {:?}, over max_concurrent_reset_streams",
@@ -1046,7 +1066,7 @@ impl Recv {
 
     pub fn clear_expired_reset_streams(&mut self, store: &mut Store, counts: &mut Counts) {
         if !self.pending_reset_expired.is_empty() {
-            let now = Instant::now();
+            let now = self.now();
             let reset_duration = self.reset_duration;
             while let Some(stream) = self.pending_reset_expired.pop_if(store, |stream| {
                 let reset_at = stream.reset_at.expect("reset_at must be set if in queue");
@@ -1099,10 +1119,10 @@ impl Recv {
         &mut self,
         store: &mut Store,
         counts: &mut Counts,
-        dst: &mut Codec<T, Prioritized<B>>,
+        dst: &mut T,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         // Send any pending connection level window updates
@@ -1119,12 +1139,9 @@ impl Recv {
     }
 
     /// Send connection level window update
-    fn send_connection_window_update<T, B>(
-        &mut self,
-        dst: &mut Codec<T, Prioritized<B>>,
-    ) -> io::Result<BufferStatus>
+    fn send_connection_window_update<T, B>(&mut self, dst: &mut T) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         if let Some(incr) = self.flow.unclaimed_capacity() {
@@ -1153,10 +1170,10 @@ impl Recv {
         &mut self,
         store: &mut Store,
         counts: &mut Counts,
-        dst: &mut Codec<T, Prioritized<B>>,
+        dst: &mut T,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         loop {
@@ -1318,6 +1335,10 @@ mod tests {
         assert!(stream.pending_recv.is_empty());
         assert_eq!(stream.in_flight_recv_data, 0);
         assert_eq!(recv.in_flight_data, 0);
+        // This test owns a raw Store rather than stream handles. Release its
+        // synthetic stream too, as required by the unstable leak assertion.
+        stream.unlink();
+        stream.remove();
     }
 }
 

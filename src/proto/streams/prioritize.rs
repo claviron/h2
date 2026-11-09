@@ -1,5 +1,6 @@
 use super::store::Resolve;
 use super::*;
+use crate::codec::FrameIo;
 
 use crate::frame::Reason;
 
@@ -510,10 +511,10 @@ impl Prioritize {
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
-        dst: &mut Codec<T, Prioritized<B>>,
+        dst: &mut T,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         // Reclaim any frame that has previously been written
@@ -561,9 +562,10 @@ impl Prioritize {
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
-        dst: &mut Codec<T, Prioritized<B>>,
+        dst: &mut T,
     ) -> bool
     where
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         self.reclaim_frame(buffer, store, dst)
@@ -580,9 +582,10 @@ impl Prioritize {
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
-        dst: &mut Codec<T, Prioritized<B>>,
+        dst: &mut T,
     ) -> bool
     where
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         let span = tracing::trace_span!("try_reclaim_frame");

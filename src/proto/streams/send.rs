@@ -1,13 +1,13 @@
 use super::{
-    store, Buffer, BufferStatus, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store,
-    Stream, StreamId, StreamIdOverflow, WindowSize,
+    store, Buffer, BufferStatus, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream,
+    StreamId, StreamIdOverflow, WindowSize,
 };
+use crate::codec::FrameIo;
 use crate::codec::UserError;
 use crate::frame::{self, Reason};
 use crate::proto::{self, Error, Initiator};
 
 use bytes::Buf;
-use tokio::io::AsyncWrite;
 
 use std::cmp::Ordering;
 use std::io;
@@ -349,10 +349,10 @@ impl Send {
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
-        dst: &mut Codec<T, Prioritized<B>>,
+        dst: &mut T,
     ) -> io::Result<BufferStatus>
     where
-        T: AsyncWrite + Unpin,
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         self.prioritize.buffer_pending(buffer, store, counts, dst)
@@ -362,9 +362,10 @@ impl Send {
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
-        dst: &mut Codec<T, Prioritized<B>>,
+        dst: &mut T,
     ) -> bool
     where
+        T: FrameIo<Prioritized<B>>,
         B: Buf,
     {
         self.prioritize.reclaim_written_frame(buffer, store, dst)

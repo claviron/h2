@@ -581,9 +581,9 @@ impl store::Next for NextResetExpire {
     }
 
     fn set_queued(stream: &mut Stream, val: bool) {
-        if val {
-            stream.reset_at = Some(Instant::now());
-        } else {
+        // Recv assigns the timestamp immediately after insertion. Queue
+        // membership must not read a clock; the Sans-I/O caller owns time.
+        if !val {
             stream.reset_at = None;
         }
     }
