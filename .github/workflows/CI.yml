@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - sans-io
 env:
   RUST_BACKTRACE: 1
 
@@ -64,7 +65,7 @@ jobs:
         run: cargo check --features unstable
 
       - name: Run lib tests and doc tests
-        run: cargo test
+        run: cargo test --workspace --all-features
 
       - name: Run integration tests
         run: cargo test -p h2-tests
@@ -121,7 +122,7 @@ jobs:
           cargo update --package itoa --precise 1.0.15
 
 
-      - run: cargo check -p h2
+      - run: cargo check -p h2-forked
 
   minimal-versions:
     runs-on: ubuntu-latest

@@ -1286,6 +1286,22 @@ impl Recv {
     }
 }
 
+// ===== impl Open =====
+
+impl Open {
+    pub fn is_push_promise(&self) -> bool {
+        matches!(*self, Self::PushPromise)
+    }
+}
+
+// ===== impl RecvHeaderBlockError =====
+
+impl From<Error> for RecvHeaderBlockError {
+    fn from(err: Error) -> Self {
+        RecvHeaderBlockError::State(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,21 +1355,5 @@ mod tests {
         // synthetic stream too, as required by the unstable leak assertion.
         stream.unlink();
         stream.remove();
-    }
-}
-
-// ===== impl Open =====
-
-impl Open {
-    pub fn is_push_promise(&self) -> bool {
-        matches!(*self, Self::PushPromise)
-    }
-}
-
-// ===== impl RecvHeaderBlockError =====
-
-impl From<Error> for RecvHeaderBlockError {
-    fn from(err: Error) -> Self {
-        RecvHeaderBlockError::State(err)
     }
 }

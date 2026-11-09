@@ -1,3 +1,13 @@
+# h2-forked 0.4.20
+
+* Publish the fork as `h2-forked`, retaining the `h2` library name and async APIs.
+* Add the opt-in `sans-io` client Session with caller-owned I/O and monotonic time.
+* Share framing, HPACK, flow control and protocol checks with the async adapters.
+* Cover fragmented input, partial output, stream limits, cancellation, trailers
+  and connection shutdown.
+
+The upstream release history follows.
+
 # 0.4.20 (October 6, 2026)
 
 * Fix counting reserved push promises against stream concurrency limits.

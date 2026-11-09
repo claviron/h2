@@ -1,76 +1,74 @@
-# H2
+# h2-forked
 
-A Tokio aware, HTTP/2 client & server implementation for Rust.
+HTTP/2 with Tokio client/server APIs and an optional buffer-driven client.
+A fork of [Hyperium h2](https://github.com/hyperium/h2), based on v0.4.20.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Crates.io](https://img.shields.io/crates/v/h2.svg)](https://crates.io/crates/h2)
-[![Documentation](https://docs.rs/h2/badge.svg)][dox]
+[![Crates.io](https://img.shields.io/crates/v/h2-forked.svg)](https://crates.io/crates/h2-forked)
+[![Documentation](https://docs.rs/h2-forked/badge.svg)](https://docs.rs/h2-forked)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-More information about this crate can be found in the [crate documentation][dox].
+The async client and server retain the upstream API. The `sans-io` feature adds
+`h2::client::sans_io::Session` for clients driven by Mio or another event loop.
+Both paths share framing, HPACK, flow control and protocol validation.
 
-[dox]: https://docs.rs/h2
+## Install
 
-## Features
-
-* Client and server HTTP/2 implementation.
-* Implements the full HTTP/2 specification.
-* Passes [h2spec](https://github.com/summerwind/h2spec).
-* Focus on performance and correctness.
-* Built on [Tokio](https://tokio.rs).
-
-## Non goals
-
-This crate is intended to only be an implementation of the HTTP/2
-specification. It does not handle:
-
-* Managing TCP connections
-* HTTP 1.0 upgrade
-* TLS
-* Any feature not described by the HTTP/2 specification.
-
-This crate is now used by [hyper](https://github.com/hyperium/hyper), which will provide all of these features.
-
-## Usage
-
-To use `h2`, first add this to your `Cargo.toml`:
+Keep `h2` as the dependency name when replacing upstream:
 
 ```toml
 [dependencies]
-h2 = "0.4"
+h2 = { package = "h2-forked", version = "0.4.20" }
 ```
 
-Next, add this to your crate:
+For the buffer-driven client:
+
+```toml
+[dependencies]
+h2 = { package = "h2-forked", version = "0.4.20", features = ["sans-io"] }
+```
+
+## Buffer-driven client
 
 ```rust
-extern crate h2;
+use h2::client::{Builder, sans_io::Session};
+use std::time::Instant;
 
-use h2::server::Connection;
-
-fn main() {
-    // ...
-}
+let now = Instant::now();
+let mut session = Session::new(Builder::new(), now);
+session.drive(now)?;
+let bytes_to_write = session.output();
 ```
 
-## FAQ
+The caller owns transport I/O, readiness and request deadlines:
 
-**Is this an embedded Java SQL database engine?**
+1. Fill `input()` with received bytes and call `drive(now)`.
+2. Drain `next_event()` and release consumed DATA with `release_capacity`.
+3. Write borrowed `output()` segments, then report accepted bytes with
+   `advance_output(count)` and drive again.
+4. Continue while progress is possible; wait for transport readiness otherwise.
 
-[No](https://www.h2database.com).
+After the peer's SETTINGS arrive, `is_ready()` and `available_streams()` describe
+request capacity. `send_request` opens a stream; `reset(stream, Reason::CANCEL)`
+cancels that stream. `close` queues GOAWAY: keep driving and draining output
+until shutdown completes. Notify the session of transport EOF with `end_input`.
 
-## Buffer-driven client (development)
+No socket, executor, background task or timer is created by this API. The crate
+still depends on Tokio for its async adapters and shared protocol machinery.
+Server push is disabled for the buffer-driven client. Internal stream handles
+retain the synchronized store; stream creation is not allocation-free.
 
-The `sans-io` feature exposes `client::sans_io::Session`. The caller supplies
-input bytes and monotonic time, drains borrowed output segments, and handles
-response events. No socket, executor, or timer is created. The async client and
-server continue to use the same framing, HPACK and protocol state machine.
+## Tokio APIs
 
-Call `drive(now)` after input, output progress or a protocol operation. Drain
-`next_event()` before waiting for transport readiness. `Data` events retain
-receive-window credit until `release_capacity` is called. Request deadlines are
-the caller's responsibility: `reset(stream, Reason::CANCEL)` affects that stream
-alone. `close` queues GOAWAY; keep driving and draining output until complete.
-Server push is disabled by this client API. Stream ownership still uses the
-existing synchronized store; this is not an allocation-free implementation.
+The existing `h2::client::handshake` and `h2::server::handshake` APIs accept an
+async transport supplied by the caller. TCP, TLS/ALPN, HTTP/1.1 upgrades,
+connection pooling and application routing remain outside this crate.
 
-This feature is an experimental fork extension, not part of the published
-upstream release. It is intended for readiness-driven clients such as Mio.
+## Fork scope
+
+The buffer-driven client is a fork extension, not an upstream h2 API. A matching
+base version identifies the upstream starting point; it does not make the two
+packages interchangeable Rust types. Keep dependencies that exchange h2 types
+on the same package.
+
+The original implementation and MIT license are retained. See the
+[API documentation](https://docs.rs/h2-forked) and [changelog](CHANGELOG.md).

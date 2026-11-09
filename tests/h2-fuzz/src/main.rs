@@ -37,7 +37,7 @@ impl<'a> AsyncRead for MockIo<'a> {
         if self.input.is_empty() {
             Poll::Ready(Ok(()))
         } else if len == 0 {
-            cx.waker().clone().wake();
+            cx.waker().wake_by_ref();
             Poll::Pending
         } else {
             if len > self.input.len() {
@@ -65,7 +65,7 @@ impl<'a> AsyncWrite for MockIo<'a> {
             if self.input.is_empty() {
                 Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
             } else {
-                cx.waker().clone().wake();
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
         } else {

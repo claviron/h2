@@ -607,7 +607,7 @@ async fn padded_data_stream_error_releases_connection_capacity() {
 
     // Padded EOS frame: 1 byte pad_len + 8 bytes data + 1 byte padding.
     // flow_controlled_len = 10, payload (data only) = 8.
-    let mut padded_eos = vec![0u8; 10];
+    let mut padded_eos = [0u8; 10];
     padded_eos[0] = 1;
 
     let srv = async move {

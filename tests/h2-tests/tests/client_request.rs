@@ -2118,7 +2118,7 @@ async fn server_drop_connection_after_go_away() {
                 .await
                 .expect("request");
         });
-        let _ = h2.await.unwrap();
+        h2.await.unwrap();
     };
     join(srv, h2).await;
 }
@@ -2146,7 +2146,7 @@ async fn reset_before_headers_reaches_peer_without_headers() {
 
         match frame {
             frame::Frame::Headers(h) if h.stream_id() == StreamId::from(1) => {
-                assert!(h.is_end_stream() == false);
+                assert!(!h.is_end_stream());
             }
             frame::Frame::Reset(rst) if rst.stream_id() == StreamId::from(1) => {
                 panic!(
