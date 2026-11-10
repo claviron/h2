@@ -78,9 +78,9 @@ pub struct Pseudo {
 }
 
 #[derive(Debug)]
-pub struct Iter {
+pub struct Iter<'a> {
     /// Pseudo headers
-    pseudo: Option<Pseudo>,
+    pseudo: Option<&'a mut Pseudo>,
 
     /// Header fields
     fields: header::IntoIter<HeaderValue>,
@@ -710,7 +710,7 @@ impl EncodingHeaderBlock {
 
 // ===== impl Iter =====
 
-impl Iterator for Iter {
+impl Iterator for Iter<'_> {
     type Item = hpack::Header<Option<HeaderName>>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -989,11 +989,11 @@ impl HeaderBlock {
         Ok(())
     }
 
-    fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
+    fn into_encoding(mut self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
         let mut hpack = encoder.take_scratch();
         hpack.clear();
         let mut headers = Iter {
-            pseudo: Some(self.pseudo),
+            pseudo: Some(&mut self.pseudo),
             fields: self.fields.into_iter(),
         };
 
