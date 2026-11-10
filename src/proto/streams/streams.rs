@@ -1486,6 +1486,17 @@ impl OpaqueStreamRef {
         me.actions.recv.poll_response(cx, &mut stream)
     }
 
+    #[cfg(feature = "sans-io")]
+    pub(crate) fn poll_response_head(
+        &mut self,
+        cx: &Context,
+    ) -> Poll<Result<super::ResponseHead<()>, proto::Error>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.key);
+        me.actions.recv.poll_response_head(cx, &mut stream)
+    }
+
     /// Called by a client to check for informational responses (1xx status codes)
     pub fn poll_informational(
         &mut self,

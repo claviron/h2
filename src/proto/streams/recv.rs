@@ -70,6 +70,13 @@ pub(super) enum Event {
     InformationalHeaders(peer::PollMessage),
 }
 
+#[cfg(feature = "sans-io")]
+#[derive(Debug)]
+pub(crate) enum ResponseHead<B> {
+    Informational(Response<()>),
+    Final(Response<B>),
+}
+
 #[derive(Debug)]
 pub(super) struct DataEvent {
     pub(super) payload: Bytes,
@@ -374,6 +381,36 @@ impl Recv {
                     stream.recv_task = Some(cx.waker().clone());
                     return Poll::Pending;
                 }
+            }
+        }
+    }
+
+    /// Receive the next informational or final head without putting it back.
+    #[cfg(feature = "sans-io")]
+    pub fn poll_response_head(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Result<ResponseHead<()>, proto::Error>> {
+        use super::peer::PollMessage::Client;
+
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::InformationalHeaders(Client(response))) => {
+                Poll::Ready(Ok(ResponseHead::Informational(response)))
+            }
+            Some(Event::Headers(Client(response))) => {
+                Poll::Ready(Ok(ResponseHead::Final(response)))
+            }
+            Some(_) => panic!("poll_response_head called after response returned"),
+            None => {
+                if !stream.state.ensure_recv_open()? {
+                    return Poll::Ready(Err(Error::library_reset(
+                        stream.id,
+                        Reason::PROTOCOL_ERROR,
+                    )));
+                }
+                stream.recv_task = Some(cx.waker().clone());
+                Poll::Pending
             }
         }
     }

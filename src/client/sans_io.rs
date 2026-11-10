@@ -18,8 +18,6 @@ use bytes::{Bytes, BytesMut};
 use fnv::FnvHashMap;
 use http::{HeaderMap, Request, Response};
 use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Wake, Waker};
@@ -348,26 +346,21 @@ impl Session {
             let stream = StreamId::from_internal(id.into());
             let mut cx = Context::from_waker(&self.waker);
             let event = match &mut exchange.receiving {
-                Receiving::Head(response) => {
-                    if let std::task::Poll::Ready(Some(result)) =
-                        response.poll_informational(&mut cx)
-                    {
-                        Some(result.map(|response| Event::Informational { stream, response }))
-                    } else {
-                        match Pin::new(response).poll(&mut cx) {
-                            std::task::Poll::Ready(Ok(response)) => {
-                                let (head, body) = response.into_parts();
-                                exchange.receiving = Receiving::Body(body);
-                                Some(Ok(Event::Headers {
-                                    stream,
-                                    response: Response::from_parts(head, ()),
-                                }))
-                            }
-                            std::task::Poll::Ready(Err(error)) => Some(Err(error)),
-                            std::task::Poll::Pending => None,
-                        }
+                Receiving::Head(response) => match response.poll_response_head(&mut cx) {
+                    std::task::Poll::Ready(Ok(proto::ResponseHead::Informational(response))) => {
+                        Some(Ok(Event::Informational { stream, response }))
                     }
-                }
+                    std::task::Poll::Ready(Ok(proto::ResponseHead::Final(response))) => {
+                        let (head, body) = response.into_parts();
+                        exchange.receiving = Receiving::Body(body);
+                        Some(Ok(Event::Headers {
+                            stream,
+                            response: Response::from_parts(head, ()),
+                        }))
+                    }
+                    std::task::Poll::Ready(Err(error)) => Some(Err(error)),
+                    std::task::Poll::Pending => None,
+                },
                 Receiving::Body(body) => match body.poll_data(&mut cx) {
                     std::task::Poll::Ready(Some(Ok(bytes))) => {
                         exchange.unconsumed += bytes.len();
@@ -584,6 +577,120 @@ mod tests {
         );
         assert!(session.next_event().is_none());
         drain(&mut session);
+    }
+
+    #[test]
+    fn multiple_informational_heads_precede_final_headers_and_body() {
+        let mut session = ready(1);
+        let id = open(&mut session, true);
+        drain(&mut session);
+        for status in [http::StatusCode::CONTINUE, http::StatusCode::EARLY_HINTS] {
+            let head = frame::Headers::new(
+                id.as_u32().into(),
+                frame::Pseudo::response(status),
+                HeaderMap::new(),
+            );
+            session.input().extend_from_slice(&wire(head.into()));
+        }
+        session.input().extend_from_slice(&headers(id, false));
+        session.input().extend_from_slice(&wire(
+            frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ok")).into(),
+        ));
+        let mut fields = HeaderMap::new();
+        fields.insert("x-finished", http::HeaderValue::from_static("yes"));
+        session.input().extend_from_slice(&wire(
+            frame::Headers::trailers(id.as_u32().into(), fields).into(),
+        ));
+        session.drive(session.now).unwrap();
+
+        for status in [http::StatusCode::CONTINUE, http::StatusCode::EARLY_HINTS] {
+            assert!(matches!(session.next_event(),
+                Some(Event::Informational { stream, response })
+                if stream == id && response.status() == status));
+        }
+        assert!(matches!(session.next_event(),
+            Some(Event::Headers { stream, response })
+            if stream == id && response.status() == http::StatusCode::OK));
+        assert!(matches!(session.next_event(),
+            Some(Event::Data { stream, bytes }) if stream == id && bytes == "ok"));
+        session.release_capacity(id, 2).unwrap();
+        assert!(matches!(session.next_event(),
+            Some(Event::End { stream, trailers: Some(fields) })
+            if stream == id && fields["x-finished"] == "yes"));
+        assert!(session.next_event().is_none());
+    }
+
+    #[test]
+    fn informational_then_fragmented_final_head_stays_pending_until_complete() {
+        let mut session = ready(1);
+        let id = open(&mut session, true);
+        drain(&mut session);
+        let early = frame::Headers::new(
+            id.as_u32().into(),
+            frame::Pseudo::response(http::StatusCode::EARLY_HINTS),
+            HeaderMap::new(),
+        );
+        session.input().extend_from_slice(&wire(early.into()));
+        session.drive(session.now).unwrap();
+        assert!(matches!(
+            session.next_event(),
+            Some(Event::Informational { .. })
+        ));
+        assert!(session.next_event().is_none());
+
+        let final_head = headers(id, true);
+        let last = final_head.len() - 1;
+        for byte in &final_head[..last] {
+            session.input().extend_from_slice(&[*byte]);
+            session.drive(session.now).unwrap();
+            assert!(session.next_event().is_none());
+        }
+        session.input().extend_from_slice(&final_head[last..]);
+        session.drive(session.now).unwrap();
+        assert!(matches!(session.next_event(),
+            Some(Event::Headers { stream, .. }) if stream == id));
+        assert!(matches!(session.next_event(),
+            Some(Event::End { stream, trailers: None }) if stream == id));
+        assert!(session.next_event().is_none());
+    }
+
+    #[test]
+    fn pending_head_is_woken_by_final_headers_or_remote_reset() {
+        for reset in [false, true] {
+            let mut session = ready(1);
+            let id = open(&mut session, true);
+            drain(&mut session);
+            let progress = Arc::new(Progress::default());
+            let waker = Waker::from(progress.clone());
+            let mut cx = Context::from_waker(&waker);
+            match &mut session.exchanges.get_mut(&id.as_u32()).unwrap().receiving {
+                Receiving::Head(response) => {
+                    assert!(response.poll_response_head(&mut cx).is_pending());
+                }
+                _ => panic!("request must still be waiting for headers"),
+            }
+            assert!(!progress.0.load(Ordering::Relaxed));
+
+            let input = if reset {
+                wire(frame::Reset::new(id.as_u32().into(), Reason::REFUSED_STREAM).into())
+            } else {
+                headers(id, true)
+            };
+            session.input().extend_from_slice(&input);
+            session.drive(session.now).unwrap();
+            assert!(progress.0.load(Ordering::Relaxed));
+            if reset {
+                assert!(matches!(session.next_event(),
+                    Some(Event::Failed { stream, error })
+                    if stream == id && error.reason() == Some(Reason::REFUSED_STREAM)));
+            } else {
+                assert!(matches!(session.next_event(),
+                    Some(Event::Headers { stream, .. }) if stream == id));
+                assert!(matches!(session.next_event(),
+                    Some(Event::End { stream, .. }) if stream == id));
+            }
+            assert!(session.next_event().is_none());
+        }
     }
 
     #[test]
