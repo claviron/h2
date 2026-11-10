@@ -9,7 +9,7 @@ authors = [
   "Carl Lerche <me@carllerche.com>",
   "Sean McArthur <sean@seanmonstar.com>",
 ]
-description = "HTTP/2 with Tokio APIs and a buffer-driven client"
+description = "A Sans-I/O HTTP/2 client for caller-owned I/O, scheduling and time"
 documentation = "https://docs.rs/h2-forked"
 repository = "https://github.com/claviron/h2"
 keywords = ["http", "http2", "async", "sans-io", "non-blocking"]

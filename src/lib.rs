@@ -1,13 +1,13 @@
-//! HTTP/2 with Tokio client/server APIs and an optional buffer-driven client.
+//! A Sans-I/O HTTP/2 client for caller-owned I/O, scheduling and time.
 //!
 //! This is a fork of Hyperium's `h2`. With the `sans-io` feature,
 //! `client::sans_io::Session` lets the caller supply bytes and monotonic time
 //! without creating a socket, runtime, background task, or timer.
 //!
-//! This library implements the [HTTP/2] specification. The implementation is
-//! asynchronous, using [futures] as the basis for the API. The implementation
-//! is also decoupled from TCP or TLS details. The user must handle ALPN and
-//! HTTP/1.1 upgrades themselves.
+//! This library implements the [HTTP/2] specification. The existing async client
+//! and server APIs remain available, using [futures]. Both paths share framing,
+//! HPACK, flow control and protocol validation. The user supplies transport I/O
+//! and handles ALPN and HTTP/1.1 upgrades.
 //!
 //! # Getting started
 //!
@@ -15,7 +15,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! h2 = { package = "h2-forked", version = "0.4.20" }
+//! h2 = { package = "h2-forked", version = "0.4.20", features = ["sans-io"] }
 //! ```
 //!
 //! # Layout

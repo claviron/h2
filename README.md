@@ -1,33 +1,28 @@
 # h2-forked
 
-HTTP/2 with Tokio client/server APIs and an optional buffer-driven client.
-A fork of [Hyperium h2](https://github.com/hyperium/h2), based on v0.4.20.
+**Drive HTTP/2 from your own event loop.**
+
+A Sans-I/O client: supply bytes and monotonic time, drain output, and handle
+response events. You own the transport, scheduling and request deadlines.
 
 [![Crates.io](https://img.shields.io/crates/v/h2-forked.svg)](https://crates.io/crates/h2-forked)
 [![Documentation](https://docs.rs/h2-forked/badge.svg)](https://docs.rs/h2-forked)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-The async client and server retain the upstream API. The `sans-io` feature adds
-`h2::client::sans_io::Session` for clients driven by Mio or another event loop.
-Both paths share framing, HPACK, flow control and protocol validation.
+`h2::client::sans_io::Session` creates no socket, runtime, background task or
+timer. Use it with Mio or another event loop. Framing, HPACK, flow control and
+protocol validation are shared with the retained async client and server.
 
 ## Install
 
-Keep `h2` as the dependency name when replacing upstream:
-
-```toml
-[dependencies]
-h2 = { package = "h2-forked", version = "0.4.20" }
-```
-
-For the buffer-driven client:
+Enable the `sans-io` feature, keeping `h2` as the dependency name:
 
 ```toml
 [dependencies]
 h2 = { package = "h2-forked", version = "0.4.20", features = ["sans-io"] }
 ```
 
-## Buffer-driven client
+## Sans-I/O client
 
 ```rust
 use h2::client::{Builder, sans_io::Session};
@@ -52,20 +47,43 @@ request capacity. `send_request` opens a stream; `reset(stream, Reason::CANCEL)`
 cancels that stream. `close` queues GOAWAY: keep driving and draining output
 until shutdown completes. Notify the session of transport EOF with `end_input`.
 
-No socket, executor, background task or timer is created by this API. The crate
-still depends on Tokio for its async adapters and shared protocol machinery.
-Server push is disabled for the buffer-driven client. Internal stream handles
-retain the synchronized store; stream creation is not allocation-free.
+Server push is disabled for this client. Internal stream handles retain the
+synchronized store; stream creation is not allocation-free.
+
+## Example: brk with Mio
+
+In one split-host Linux comparison, brk's Mio + Sans-I/O path delivered **47%
+more responses/s** with **33% less client CPU per response** than its async path:
+
+| Client | Responses/s | Client CPU µs/response | Mean outstanding |
+| --- | ---: | ---: | ---: |
+| Async | 185,868 | 10.06 | 1,020 |
+| Mio + Sans-I/O | 273,984 | 6.73 | 765 |
+
+H2c GET with a two-byte `ok` response. Target: 128 connections × 8 streams,
+two client threads, four responder workers,
+10-second phases and 100-ms deadlines; four runs per client, all error-free.
+Achieved concurrency differed, so this is an observed result rather than a
+demonstrated gain at equal achieved load.
 
 ## Tokio APIs
+
+The existing async APIs remain available without enabling `sans-io`:
+
+```toml
+[dependencies]
+h2 = { package = "h2-forked", version = "0.4.20" }
+```
 
 The existing `h2::client::handshake` and `h2::server::handshake` APIs accept an
 async transport supplied by the caller. TCP, TLS/ALPN, HTTP/1.1 upgrades,
 connection pooling and application routing remain outside this crate.
+The crate still depends on Tokio for its async adapters and shared machinery.
 
 ## Fork scope
 
-The buffer-driven client is a fork extension, not an upstream h2 API. A matching
+Based on [Hyperium h2](https://github.com/hyperium/h2) v0.4.20. The Sans-I/O
+client is a fork extension, not an upstream h2 API. A matching
 base version identifies the upstream starting point; it does not make the two
 packages interchangeable Rust types. Keep dependencies that exchange h2 types
 on the same package.
