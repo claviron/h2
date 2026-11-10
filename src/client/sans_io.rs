@@ -11,13 +11,12 @@
 //! checks are shared with the async client. Internal stream handles still use
 //! the existing synchronized store; this API does not promise allocation-free
 //! stream creation.
-use super::{Builder, Peer, ResponseFuture, SendRequest};
+use super::{Builder, Peer, SendRequest};
 use crate::codec::{raw::Raw, FrameIo, UserError};
-use crate::{proto, Error, Reason, SendStream, StreamId};
+use crate::{proto, Error, Reason, StreamId};
 use bytes::{Bytes, BytesMut};
 use fnv::FnvHashMap;
 use http::{HeaderMap, Request, Response};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -69,24 +68,30 @@ enum ReceivePhase {
     Body,
 }
 
-/// Retains the response's existing reference through headers, body and credit.
+/// One stream reference owns both halves until send, receive and credit finish.
 #[derive(Debug)]
-struct ReceiveCursor {
-    inner: proto::OpaqueStreamRef,
+struct Exchange {
+    stream: proto::StreamRef<Bytes>,
     phase: ReceivePhase,
+    unconsumed: usize,
+    done: bool,
+    sent: bool,
 }
 
-impl ReceiveCursor {
-    fn new(response: ResponseFuture) -> Self {
+impl Exchange {
+    fn new(stream: proto::StreamRef<Bytes>, sent: bool) -> Self {
         Self {
-            inner: response.inner,
+            stream,
             phase: ReceivePhase::Head,
+            unconsumed: 0,
+            done: false,
+            sent,
         }
     }
 
     fn poll_next(&mut self, stream: StreamId, cx: &Context<'_>) -> Poll<Result<Event, Error>> {
         match self.phase {
-            ReceivePhase::Head => match ready!(self.inner.poll_response_head(cx))? {
+            ReceivePhase::Head => match ready!(self.stream.opaque_mut().poll_response_head(cx))? {
                 proto::ResponseHead::Informational(response) => {
                     Poll::Ready(Ok(Event::Informational { stream, response }))
                 }
@@ -95,7 +100,7 @@ impl ReceiveCursor {
                     Poll::Ready(Ok(Event::Headers { stream, response }))
                 }
             },
-            ReceivePhase::Body => match ready!(self.inner.poll_response_body(cx))? {
+            ReceivePhase::Body => match ready!(self.stream.opaque_mut().poll_response_body(cx))? {
                 proto::ResponseBody::Data(bytes) => Poll::Ready(Ok(Event::Data { stream, bytes })),
                 proto::ResponseBody::End(trailers) => {
                     Poll::Ready(Ok(Event::End { stream, trailers }))
@@ -111,28 +116,47 @@ impl ReceiveCursor {
         if count > proto::MAX_WINDOW_SIZE as usize {
             return Err(UserError::ReleaseCapacityTooBig.into());
         }
-        self.inner
+        self.stream
+            .opaque_mut()
             .release_capacity(count as proto::WindowSize)
             .map_err(Into::into)
     }
+
+    fn release_capacity_and_poll_next(
+        &mut self,
+        stream: StreamId,
+        cx: &Context<'_>,
+        count: usize,
+    ) -> Result<Poll<Result<Event, Error>>, Error> {
+        if count > proto::MAX_WINDOW_SIZE as usize {
+            return Err(UserError::ReleaseCapacityTooBig.into());
+        }
+        if matches!(self.phase, ReceivePhase::Head) {
+            return Ok(self.poll_next(stream, cx));
+        }
+        let next = self
+            .stream
+            .opaque_mut()
+            .release_capacity_and_poll_response_body(cx, count as proto::WindowSize)?;
+        Ok(next.map(|result| {
+            result
+                .map(|body| match body {
+                    proto::ResponseBody::Data(bytes) => Event::Data { stream, bytes },
+                    proto::ResponseBody::End(trailers) => Event::End { stream, trailers },
+                })
+                .map_err(Into::into)
+        }))
+    }
 }
 
-impl Drop for ReceiveCursor {
+impl Drop for Exchange {
     fn drop(&mut self) {
         // Before final headers, keep ResponseFuture's drop behavior. Afterwards,
         // discard unread DATA as RecvStream did, then release the owned reference.
         if matches!(self.phase, ReceivePhase::Body) {
-            self.inner.clear_recv_buffer();
+            self.stream.opaque_mut().clear_recv_buffer();
         }
     }
-}
-#[derive(Debug)]
-struct Exchange {
-    receiving: ReceiveCursor,
-    send: SendStream<Bytes>,
-    unconsumed: usize,
-    done: bool,
-    sent: bool,
 }
 
 #[derive(Debug, Default)]
@@ -152,7 +176,6 @@ pub struct Session {
     inner: proto::connection::Core<Raw<proto::Prioritized<Bytes>>, Peer, Bytes>,
     send: SendRequest<Bytes>,
     exchanges: FnvHashMap<u32, Exchange>,
-    ready: VecDeque<u32>,
     progress: Arc<Progress>,
     waker: Waker,
     now: Instant,
@@ -207,7 +230,6 @@ impl Session {
             inner,
             send,
             exchanges: FnvHashMap::default(),
-            ready: VecDeque::new(),
             progress,
             waker,
             now,
@@ -278,18 +300,12 @@ impl Session {
             std::task::Poll::Pending => return Ok(None),
             std::task::Poll::Ready(result) => result?,
         }
-        let (response, send) = self.send.send_request(request, end_stream)?;
-        let id = response.stream_id();
-        self.exchanges.insert(
-            id.as_u32(),
-            Exchange {
-                receiving: ReceiveCursor::new(response),
-                send,
-                unconsumed: 0,
-                done: false,
-                sent: end_stream,
-            },
-        );
+        // Retain the protocol stream directly instead of constructing separate
+        // async ResponseFuture/SendStream handles and cloning a receive ref.
+        let stream = self.send.send_request_stream(request, end_stream)?;
+        let id = StreamId::from_internal(stream.stream_id());
+        self.exchanges
+            .insert(id.as_u32(), Exchange::new(stream, end_stream));
         self.active += 1;
         self.wire_available -= 1;
         Ok(Some(id))
@@ -306,7 +322,7 @@ impl Session {
             .exchanges
             .get_mut(&stream.as_u32())
             .ok_or(UserError::InactiveStreamId)?;
-        exchange.send.send_data(bytes, end_stream)?;
+        exchange.stream.send_data(bytes, end_stream)?;
         if end_stream && !exchange.sent {
             exchange.sent = true;
             if exchange.done {
@@ -331,7 +347,7 @@ impl Session {
             if !exchange.done || !exchange.sent {
                 self.active -= 1;
             }
-            exchange.send.send_reset(reason);
+            exchange.stream.send_reset(reason);
         }
     }
     /// Return receive-window credit after consuming a DATA event.
@@ -343,7 +359,7 @@ impl Session {
         if count > exchange.unconsumed {
             return Err(UserError::ReleaseCapacityTooBig.into());
         }
-        exchange.receiving.release_capacity(count)?;
+        exchange.release_capacity(count)?;
         exchange.unconsumed -= count;
         // The body handle remains until credit has been returned, even after End.
         if exchange.unconsumed == 0 && exchange.done && exchange.sent {
@@ -372,14 +388,13 @@ impl Session {
             // once here instead of taking a store mutex in every can_open.
             (self.peer_limit, self.wire_available) = self.send.inner.send_window();
             let codec = self.inner.codec_mut();
-            self.ready.append(&mut codec.received);
             if codec.go_away && !self.go_away {
                 self.go_away = true;
-                self.ready.extend(self.exchanges.keys().copied());
+                codec.received.extend(self.exchanges.keys().copied());
             }
             if let std::task::Poll::Ready(result) = result {
                 self.closed = true;
-                self.ready.extend(self.exchanges.keys().copied());
+                codec.received.extend(self.exchanges.keys().copied());
                 result.map_err(Error::from)?;
                 return Ok(true);
             }
@@ -391,17 +406,75 @@ impl Session {
 
     /// Pop a response event. Drain events before waiting for more input.
     pub fn next_event(&mut self) -> Option<Event> {
-        while let Some(id) = self.ready.pop_front() {
+        self.next_event_inner(None)
+            .expect("no capacity release requested")
+    }
+
+    /// Return consumed DATA credit, then pop the next response event.
+    ///
+    /// Call this only after consuming or validating the previous DATA bytes.
+    /// Credit is returned immediately, even if no next event is ready. When
+    /// the same stream is at the front of the ready queue, credit return and
+    /// receive polling share one stream-store operation.
+    ///
+    /// `count` may not exceed this stream's delivered, unreleased DATA bytes.
+    /// A release error consumes neither the credit nor the next ready entry.
+    /// Protocol failures are returned as [`Event::Failed`], as in [`Self::next_event`].
+    pub fn release_capacity_and_next_event(
+        &mut self,
+        stream: StreamId,
+        count: usize,
+    ) -> Result<Option<Event>, Error> {
+        if self.inner.codec_mut().received.front() == Some(&stream.as_u32()) {
+            self.next_event_inner(Some(count))
+        } else {
+            self.release_capacity(stream, count)?;
+            Ok(self.next_event())
+        }
+    }
+
+    #[inline]
+    fn next_event_inner(&mut self, mut credit: Option<usize>) -> Result<Option<Event>, Error> {
+        while let Some(&id) = self.inner.codec_mut().received.front() {
             let exchange = match self.exchanges.get_mut(&id) {
                 Some(exchange) => exchange,
-                None => continue,
+                None => {
+                    if credit.is_some() {
+                        return Err(UserError::InactiveStreamId.into());
+                    }
+                    self.inner.codec_mut().received.pop_front();
+                    continue;
+                }
             };
-            if exchange.done {
-                continue;
-            }
             let stream = StreamId::from_internal(id.into());
             let cx = Context::from_waker(&self.waker);
-            let event = match exchange.receiving.poll_next(stream, &cx) {
+            let next = if let Some(count) = credit.take() {
+                if count > exchange.unconsumed {
+                    return Err(UserError::ReleaseCapacityTooBig.into());
+                }
+                // End can precede credit return, with the stream retained until
+                // the caller releases its last delivered bytes.
+                if exchange.done {
+                    exchange.release_capacity(count)?;
+                    exchange.unconsumed -= count;
+                    if exchange.unconsumed == 0 && exchange.sent {
+                        self.exchanges.remove(&id);
+                    }
+                    self.inner.codec_mut().received.pop_front();
+                    continue;
+                }
+                let next = exchange.release_capacity_and_poll_next(stream, &cx, count)?;
+                exchange.unconsumed -= count;
+                next
+            } else {
+                if exchange.done {
+                    self.inner.codec_mut().received.pop_front();
+                    continue;
+                }
+                exchange.poll_next(stream, &cx)
+            };
+            self.inner.codec_mut().received.pop_front();
+            let event = match next {
                 Poll::Ready(Ok(event)) => {
                     if let Event::Data { bytes, .. } = &event {
                         exchange.unconsumed += bytes.len();
@@ -423,21 +496,21 @@ impl Session {
                             self.exchanges.remove(&id);
                         }
                     } else {
-                        self.ready.push_front(id);
+                        self.inner.codec_mut().received.push_front(id);
                     }
-                    return Some(event);
+                    return Ok(Some(event));
                 }
                 Some(Err(error)) => {
                     if !exchange.done || !exchange.sent {
                         self.active -= 1;
                     }
                     self.exchanges.remove(&id);
-                    return Some(Event::Failed { stream, error });
+                    return Ok(Some(Event::Failed { stream, error }));
                 }
                 None => (),
             }
         }
-        None
+        Ok(None)
     }
 }
 
@@ -529,6 +602,329 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_frames_schedule_one_ready_entry_per_response() {
+        let mut session = ready(8);
+        let ids: Vec<_> = (0..8).map(|_| open(&mut session, true)).collect();
+        drain(&mut session);
+        for &id in &ids {
+            session.input().extend_from_slice(&headers(id, false));
+            let mut data = frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ok"));
+            data.set_end_stream(true);
+            session.input().extend_from_slice(&wire(data.into()));
+        }
+        session.drive(session.now).unwrap();
+        assert_eq!(session.inner.codec_mut().received.len(), ids.len());
+        for id in ids {
+            assert!(matches!(session.next_event(),
+                Some(Event::Headers { stream, .. }) if stream == id));
+            assert!(matches!(session.next_event(),
+                Some(Event::Data { stream, bytes }) if stream == id && bytes == "ok"));
+            session.release_capacity(id, 2).unwrap();
+            assert!(matches!(session.next_event(),
+                Some(Event::End { stream, trailers: None }) if stream == id));
+        }
+        // Completing a response must consume its only ready entry, without
+        // needing another next_event call to skip stale frame notifications.
+        assert!(session.inner.codec_mut().received.is_empty());
+        assert!(session.next_event().is_none());
+        assert_eq!(session.active, 0);
+    }
+
+    #[test]
+    fn unread_ready_entry_survives_multiple_drives_without_duplicates() {
+        let mut session = ready(1);
+        let id = open(&mut session, true);
+        drain(&mut session);
+        session.input().extend_from_slice(&headers(id, false));
+        session.drive(session.now).unwrap();
+        assert_eq!(session.inner.codec_mut().received.len(), 1);
+        let mut data = frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ok"));
+        data.set_end_stream(true);
+        let input = wire(data.into());
+        for byte in input {
+            session.input().extend_from_slice(&[byte]);
+            session.drive(session.now).unwrap();
+            assert_eq!(session.inner.codec_mut().received.len(), 1);
+        }
+        assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+        // A drive between events must not consume the requeued entry.
+        session.drive(session.now).unwrap();
+        assert_eq!(session.inner.codec_mut().received.len(), 1);
+        assert!(matches!(session.next_event(),
+            Some(Event::Data { bytes, .. }) if bytes == "ok"));
+        session.release_capacity(id, 2).unwrap();
+        assert!(matches!(session.next_event(), Some(Event::End { .. })));
+        assert!(session.inner.codec_mut().received.is_empty());
+        assert!(session.next_event().is_none());
+    }
+
+    #[test]
+    fn interleaved_streams_and_later_reset_remain_ready() {
+        let mut session = ready(2);
+        let first = open(&mut session, true);
+        let second = open(&mut session, true);
+        drain(&mut session);
+        session.input().extend_from_slice(&headers(first, false));
+        session.input().extend_from_slice(&headers(second, false));
+        let mut data = frame::Data::new(first.as_u32().into(), Bytes::from_static(b"ok"));
+        data.set_end_stream(true);
+        session.input().extend_from_slice(&wire(data.into()));
+        session.drive(session.now).unwrap();
+        // Coalescing is adjacent only; it must not reorder interleaved IDs.
+        assert_eq!(
+            session
+                .inner
+                .codec_mut()
+                .received
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [first.as_u32(), second.as_u32(), first.as_u32()]
+        );
+        assert!(matches!(session.next_event(),
+            Some(Event::Headers { stream, .. }) if stream == first));
+        assert!(matches!(session.next_event(),
+            Some(Event::Data { stream, .. }) if stream == first));
+        session.release_capacity(first, 2).unwrap();
+        assert!(matches!(session.next_event(),
+            Some(Event::End { stream, .. }) if stream == first));
+        assert!(matches!(session.next_event(),
+            Some(Event::Headers { stream, .. }) if stream == second));
+        assert!(session.next_event().is_none());
+
+        // After Pending empties the queue, the same ID must be scheduled again.
+        let reset = wire(frame::Reset::new(second.as_u32().into(), Reason::CANCEL).into());
+        for byte in reset {
+            session.input().extend_from_slice(&[byte]);
+            session.drive(session.now).unwrap();
+        }
+        assert_eq!(session.inner.codec_mut().received.len(), 1);
+        assert!(matches!(session.next_event(),
+            Some(Event::Failed { stream, error })
+            if stream == second && error.reason() == Some(Reason::CANCEL)));
+        assert!(session.next_event().is_none());
+        assert_eq!(session.active, 0);
+    }
+
+    #[test]
+    fn consumed_credit_advances_buffered_body_without_losing_partial_credit() {
+        let mut session = ready(1);
+        let id = open(&mut session, true);
+        drain(&mut session);
+        session.input().extend_from_slice(&headers(id, false));
+        session.input().extend_from_slice(&wire(
+            frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ab")).into(),
+        ));
+        let mut last = frame::Data::new(id.as_u32().into(), Bytes::from_static(b"c"));
+        last.set_end_stream(true);
+        session.input().extend_from_slice(&wire(last.into()));
+        session.drive(session.now).unwrap();
+        assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+        assert!(matches!(session.next_event(),
+            Some(Event::Data { bytes, .. }) if bytes == "ab"));
+        let queue = session.inner.codec_mut().received.clone();
+        assert!(session.release_capacity_and_next_event(id, 3).is_err());
+        assert_eq!(session.exchanges[&id.as_u32()].unconsumed, 2);
+        assert_eq!(session.inner.codec_mut().received, queue);
+        assert!(
+            matches!(session.release_capacity_and_next_event(id, 1).unwrap(),
+            Some(Event::Data { stream, bytes }) if stream == id && bytes == "c")
+        );
+        assert_eq!(session.exchanges[&id.as_u32()].unconsumed, 2);
+        assert!(
+            matches!(session.release_capacity_and_next_event(id, 2).unwrap(),
+            Some(Event::End { stream, trailers: None }) if stream == id)
+        );
+        assert!(!session.exchanges.contains_key(&id.as_u32()));
+        assert!(session.next_event().is_none());
+        assert_eq!(session.active, 0);
+    }
+
+    #[test]
+    fn credit_return_while_pending_wakes_updates_and_later_response_events() {
+        for arrival in [0, 1, 2] {
+            let mut builder = Builder::new();
+            builder.initial_window_size(4);
+            let mut session = ready_with_builder(1, builder);
+            let id = open(&mut session, true);
+            drain(&mut session);
+            session.input().extend_from_slice(&headers(id, false));
+            session.input().extend_from_slice(&wire(
+                frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ok")).into(),
+            ));
+            session.drive(session.now).unwrap();
+            assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+            assert!(matches!(session.next_event(), Some(Event::Data { .. })));
+            session.progress.0.store(false, Ordering::Relaxed);
+            assert!(session
+                .release_capacity_and_next_event(id, 2)
+                .unwrap()
+                .is_none());
+            assert_eq!(session.exchanges[&id.as_u32()].unconsumed, 0);
+            assert!(session.progress.0.load(Ordering::Relaxed));
+            let update = wire(frame::WindowUpdate::new(id.as_u32().into(), 2).into());
+            let output = drain(&mut session);
+            assert!(output.windows(update.len()).any(|bytes| bytes == update));
+
+            let input = match arrival {
+                0 => {
+                    let mut data = frame::Data::new(id.as_u32().into(), Bytes::from_static(b"!"));
+                    data.set_end_stream(true);
+                    wire(data.into())
+                }
+                1 => {
+                    let mut fields = HeaderMap::new();
+                    fields.insert("x-end", http::HeaderValue::from_static("yes"));
+                    wire(frame::Headers::trailers(id.as_u32().into(), fields).into())
+                }
+                _ => wire(frame::Reset::new(id.as_u32().into(), Reason::CANCEL).into()),
+            };
+            let progress = Arc::new(Progress::default());
+            let waker = Waker::from(progress.clone());
+            let cx = Context::from_waker(&waker);
+            assert!(session
+                .exchanges
+                .get_mut(&id.as_u32())
+                .unwrap()
+                .poll_next(id, &cx)
+                .is_pending());
+            for byte in input {
+                session.input().extend_from_slice(&[byte]);
+                session.drive(session.now).unwrap();
+            }
+            // The next completed frame schedules the previously pending cursor.
+            assert!(progress.0.load(Ordering::Relaxed));
+            match arrival {
+                0 => {
+                    assert!(matches!(session.next_event(),
+                        Some(Event::Data { stream, bytes }) if stream == id && bytes == "!"));
+                    assert!(
+                        matches!(session.release_capacity_and_next_event(id, 1).unwrap(),
+                        Some(Event::End { stream, trailers: None }) if stream == id)
+                    );
+                }
+                1 => assert!(matches!(session.next_event(),
+                    Some(Event::End { stream, trailers: Some(fields) })
+                    if stream == id && fields["x-end"] == "yes")),
+                _ => assert!(matches!(session.next_event(),
+                    Some(Event::Failed { stream, error })
+                    if stream == id && error.reason() == Some(Reason::CANCEL))),
+            }
+            assert!(!session.exchanges.contains_key(&id.as_u32()));
+            assert!(session.next_event().is_none());
+        }
+    }
+
+    #[test]
+    fn credit_return_after_end_preserves_open_send_half_and_handles_stale_ready() {
+        for sent in [false, true] {
+            for stale_ready in [false, true] {
+                let mut session = ready(1);
+                let id = open(&mut session, sent);
+                drain(&mut session);
+                session.input().extend_from_slice(&headers(id, false));
+                let mut data = frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ok"));
+                data.set_end_stream(true);
+                session.input().extend_from_slice(&wire(data.into()));
+                session.drive(session.now).unwrap();
+                assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+                assert!(matches!(session.next_event(), Some(Event::Data { .. })));
+                assert!(matches!(session.next_event(), Some(Event::End { .. })));
+                if stale_ready {
+                    // Interleaved wire notifications or GOAWAY may leave an
+                    // entry after End, while outstanding credit keeps it alive.
+                    session.inner.codec_mut().received.push_front(id.as_u32());
+                }
+                assert!(session
+                    .release_capacity_and_next_event(id, 2)
+                    .unwrap()
+                    .is_none());
+                if !sent {
+                    assert_eq!(session.active, 1);
+                    assert!(session.exchanges.contains_key(&id.as_u32()));
+                    session.send_data(id, Bytes::new(), true).unwrap();
+                }
+                assert_eq!(session.active, 0);
+                assert!(!session.exchanges.contains_key(&id.as_u32()));
+                assert!(session.release_capacity_and_next_event(id, 0).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn credit_return_for_another_stream_does_not_consume_its_ready_entry_on_error() {
+        let mut session = ready(2);
+        let first = open(&mut session, true);
+        let second = open(&mut session, true);
+        drain(&mut session);
+        session.input().extend_from_slice(&headers(first, false));
+        let mut data = frame::Data::new(first.as_u32().into(), Bytes::from_static(b"ok"));
+        data.set_end_stream(true);
+        session.input().extend_from_slice(&wire(data.into()));
+        session.input().extend_from_slice(&headers(second, true));
+        session.drive(session.now).unwrap();
+        assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+        assert!(matches!(session.next_event(), Some(Event::Data { .. })));
+        assert!(matches!(session.next_event(), Some(Event::End { .. })));
+        let queue = session.inner.codec_mut().received.clone();
+        assert!(session.release_capacity_and_next_event(first, 3).is_err());
+        assert_eq!(session.inner.codec_mut().received, queue);
+        assert!(
+            matches!(session.release_capacity_and_next_event(first, 2).unwrap(),
+            Some(Event::Headers { stream, .. }) if stream == second)
+        );
+        assert!(!session.exchanges.contains_key(&first.as_u32()));
+        assert!(matches!(session.next_event(),
+            Some(Event::End { stream, .. }) if stream == second));
+        assert!(session.next_event().is_none());
+        assert_eq!(session.active, 0);
+    }
+
+    #[test]
+    fn one_exchange_reference_owns_send_receive_and_unreleased_credit() {
+        for sent in [false, true] {
+            let mut session = ready(1);
+            let id = open(&mut session, sent);
+            // Only admission may retain an additional temporary reference.
+            let pending = usize::from(session.send.pending.is_some());
+            assert_eq!(
+                session.exchanges[&id.as_u32()].stream.ref_count(),
+                1 + pending
+            );
+            drain(&mut session);
+            let mut cx = Context::from_waker(&session.waker);
+            assert!(matches!(
+                session.send.poll_ready(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            assert_eq!(session.exchanges[&id.as_u32()].stream.ref_count(), 1);
+
+            session.input().extend_from_slice(&headers(id, false));
+            let mut data = frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ok"));
+            data.set_end_stream(true);
+            session.input().extend_from_slice(&wire(data.into()));
+            session.drive(session.now).unwrap();
+            assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+            assert_eq!(session.exchanges[&id.as_u32()].stream.ref_count(), 1);
+            assert!(matches!(session.next_event(),
+                Some(Event::Data { stream, bytes }) if stream == id && bytes == "ok"));
+            assert!(matches!(session.next_event(), Some(Event::End { .. })));
+            assert_eq!(session.exchanges[&id.as_u32()].stream.ref_count(), 1);
+            session.release_capacity(id, 2).unwrap();
+            if !sent {
+                assert_eq!(session.active, 1);
+                assert_eq!(session.exchanges[&id.as_u32()].stream.ref_count(), 1);
+                session
+                    .send_data(id, Bytes::from_static(b"request"), true)
+                    .unwrap();
+            }
+            assert_eq!(session.active, 0);
+            assert!(!session.exchanges.contains_key(&id.as_u32()));
+            drain(&mut session);
+        }
+    }
+
+    #[test]
     fn peer_limit_responses_and_credit_without_runtime() {
         let mut session = ready(1);
         let id = open(&mut session, true);
@@ -586,7 +982,6 @@ mod tests {
                 .exchanges
                 .get_mut(&id.as_u32())
                 .unwrap()
-                .receiving
                 .poll_next(id, &cx)
                 .is_pending());
             assert!(!progress.0.load(Ordering::Relaxed));
@@ -710,7 +1105,7 @@ mod tests {
             let id = open(&mut session, false);
             drain(&mut session);
             // Clear SendRequest's pending-open reference after the request is
-            // on the wire, leaving just the cursor and the send half.
+            // on the wire, leaving only the exchange's stream reference.
             let mut cx = Context::from_waker(&session.waker);
             assert!(matches!(
                 session.send.poll_ready(&mut cx),
@@ -731,17 +1126,18 @@ mod tests {
                     assert!(matches!(session.next_event(), Some(Event::Data { .. })));
                 }
             }
-            let Exchange {
-                receiving, send, ..
-            } = session.exchanges.remove(&id.as_u32()).unwrap();
-            drop(receiving);
+            let exchange = session.exchanges.remove(&id.as_u32()).unwrap();
+            // An explicit retained reference exercises the shared store's
+            // last-reference credit rule without a second production handle.
+            let retained = exchange.stream.clone_to_opaque();
+            drop(exchange);
             let update = wire(frame::WindowUpdate::new(frame::StreamId::ZERO, credit).into());
             let output = drain(&mut session);
             let returned = output.windows(update.len()).any(|bytes| bytes == update);
             // Unread buffers are returned eagerly. Delivered, uncredited bytes
-            // remain charged while the send half still keeps the stream alive.
+            // remain charged while the retained reference keeps it alive.
             assert_eq!(returned, !read_data);
-            drop(send);
+            drop(retained);
             let output = drain(&mut session);
             if read_data {
                 assert!(output.windows(update.len()).any(|bytes| bytes == update));
@@ -893,7 +1289,6 @@ mod tests {
                 .exchanges
                 .get_mut(&id.as_u32())
                 .unwrap()
-                .receiving
                 .poll_next(id, &cx)
                 .is_pending());
             assert!(!progress.0.load(Ordering::Relaxed));

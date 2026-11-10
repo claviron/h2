@@ -1196,6 +1196,18 @@ where
 // ===== impl StreamRef =====
 
 impl<B> StreamRef<B> {
+    /// Borrow the receive side without cloning a second stream reference.
+    #[cfg(feature = "sans-io")]
+    pub(crate) fn opaque_mut(&mut self) -> &mut OpaqueStreamRef {
+        &mut self.opaque
+    }
+
+    #[cfg(all(test, feature = "sans-io"))]
+    pub(crate) fn ref_count(&self) -> usize {
+        let me = self.opaque.inner.lock().unwrap();
+        me.store[self.opaque.key].ref_count
+    }
+
     pub fn send_data(&mut self, data: B, end_stream: bool) -> Result<(), UserError>
     where
         B: Buf,
@@ -1508,6 +1520,25 @@ impl OpaqueStreamRef {
         me.actions
             .recv
             .poll_response_body(cx, &mut stream, &mut me.counts)
+    }
+
+    /// Return consumed DATA credit before advancing the same receive cursor.
+    #[cfg(feature = "sans-io")]
+    pub(crate) fn release_capacity_and_poll_response_body(
+        &mut self,
+        cx: &Context,
+        capacity: WindowSize,
+    ) -> Result<Poll<Result<super::ResponseBody, proto::Error>>, UserError> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.key);
+        me.actions
+            .recv
+            .release_capacity(capacity, &mut stream, &mut me.actions.task)?;
+        Ok(me
+            .actions
+            .recv
+            .poll_response_body(cx, &mut stream, &mut me.counts))
     }
 
     /// Called by a client to check for informational responses (1xx status codes)

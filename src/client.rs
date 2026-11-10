@@ -522,16 +522,8 @@ where
         request: Request<()>,
         end_of_stream: bool,
     ) -> Result<(ResponseFuture, SendStream<B>), crate::Error> {
-        self.inner
-            .send_request(request, end_of_stream, self.pending.as_ref())
-            .map_err(Into::into)
-            .map(|(stream, is_full)| {
-                if stream.is_pending_open() && is_full {
-                    // Only prevent sending another request when the request queue
-                    // is not full.
-                    self.pending = Some(stream.clone_to_opaque());
-                }
-
+        self.send_request_stream(request, end_of_stream)
+            .map(|stream| {
                 let response = ResponseFuture {
                     inner: stream.clone_to_opaque(),
                     push_promise_consumed: false,
@@ -541,6 +533,24 @@ where
 
                 (response, stream)
             })
+    }
+
+    // Both frontends share admission/pending-open handling. The Sans-I/O
+    // session retains this stream directly instead of splitting async handles.
+    #[inline]
+    fn send_request_stream(
+        &mut self,
+        request: Request<()>,
+        end_of_stream: bool,
+    ) -> Result<proto::StreamRef<B>, crate::Error> {
+        let (stream, is_full) =
+            self.inner
+                .send_request(request, end_of_stream, self.pending.as_ref())?;
+        if stream.is_pending_open() && is_full {
+            // Retain the pending-open stream until poll_ready admits it.
+            self.pending = Some(stream.clone_to_opaque());
+        }
+        Ok(stream)
     }
 
     /// Returns whether the [extended CONNECT protocol][1] is enabled or not.

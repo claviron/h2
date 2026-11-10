@@ -1,3 +1,17 @@
+# Unreleased
+
+* Share one Sans-I/O ready-stream queue between decoding and event delivery.
+  Coalesce adjacent notifications for the same stream, including across drives,
+  while retaining interleaved stream order and explicit DATA credit handling.
+* Add `Session::release_capacity_and_next_event` to return consumed DATA credit
+  and advance the ready stream under one store guard, without deferring credit
+  until another frame arrives.
+* Keep one protocol stream reference per Sans-I/O exchange instead of creating
+  separate async response/send handles. Retain the pending-open reference only
+  while needed for stream admission.
+* A controlled Linux H2c comparison found the combined throughput and CPU cost
+  differences within run-to-run noise; no performance gain or regression is claimed.
+
 # h2-forked 0.4.21
 
 * Borrow the header iterator and pseudo headers during HPACK encoding, avoiding

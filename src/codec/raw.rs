@@ -22,6 +22,8 @@ pub(crate) struct Raw<B> {
     max_frame: usize,
     pending_len: Option<usize>,
     eof: bool,
+    // Shared by frame decoding and Session's event drain. One entry keeps a
+    // stream scheduled until its receive cursor reaches Pending or End.
     pub(crate) received: VecDeque<u32>,
     pub(crate) go_away: bool,
 }
@@ -120,7 +122,10 @@ impl<B: Buf> Stream for Raw<B> {
             let id = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) & 0x7fff_ffff;
             match me.decoder.decode(bytes)? {
                 Some(frame) => {
-                    if id != 0 {
+                    // A ready entry drains all buffered events for its stream.
+                    // Preserve interleaving, but do not schedule adjacent
+                    // HEADERS/DATA/trailers for the same stream repeatedly.
+                    if id != 0 && me.received.back() != Some(&id) {
                         me.received.push_back(id);
                     }
                     if matches!(frame, Frame::GoAway(_)) {
