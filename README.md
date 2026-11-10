@@ -19,7 +19,7 @@ Enable the `sans-io` feature, keeping `h2` as the dependency name:
 
 ```toml
 [dependencies]
-h2 = { package = "h2-forked", version = "0.4.20", features = ["sans-io"] }
+h2 = { package = "h2-forked", version = "0.4.21", features = ["sans-io"] }
 ```
 
 ## Sans-I/O client
@@ -52,8 +52,9 @@ synchronized store; stream creation is not allocation-free.
 
 ## Example: brk with Mio
 
-In one split-host Linux comparison, brk's Mio + Sans-I/O path delivered **47%
-more responses/s** with **33% less client CPU per response** than its async path:
+In one split-host Linux comparison using `h2-forked 0.4.20`, brk's Mio +
+Sans-I/O path delivered **47% more responses/s** with **33% less client CPU per
+response** than its async path:
 
 | Client | Responses/s | Client CPU µs/response | Mean outstanding |
 | --- | ---: | ---: | ---: |
@@ -72,7 +73,7 @@ The existing async APIs remain available without enabling `sans-io`:
 
 ```toml
 [dependencies]
-h2 = { package = "h2-forked", version = "0.4.20" }
+h2 = { package = "h2-forked", version = "0.4.21" }
 ```
 
 The existing `h2::client::handshake` and `h2::server::handshake` APIs accept an
@@ -83,10 +84,9 @@ The crate still depends on Tokio for its async adapters and shared machinery.
 ## Fork scope
 
 Based on [Hyperium h2](https://github.com/hyperium/h2) v0.4.20. The Sans-I/O
-client is a fork extension, not an upstream h2 API. A matching
-base version identifies the upstream starting point; it does not make the two
-packages interchangeable Rust types. Keep dependencies that exchange h2 types
-on the same package.
+client is a fork extension, not an upstream h2 API. The fork has its own patch
+releases and distinct Rust types. Keep dependencies that exchange h2 types on
+the same package.
 
 The original implementation and MIT license are retained. See the
 [API documentation](https://docs.rs/h2-forked) and [changelog](CHANGELOG.md).

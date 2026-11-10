@@ -1,3 +1,13 @@
+# h2-forked 0.4.21
+
+* Borrow the header iterator and pseudo headers during HPACK encoding, avoiding
+  aggregate copies.
+* Consume informational and final response heads in one stream-store operation.
+* Keep one Sans-I/O receive cursor across headers, DATA, trailers and outstanding
+  flow-control credit, removing the head-to-body reference clone/drop transition.
+* Read DATA and trailers/EOF under one store guard while preserving cancellation,
+  wake behavior and early responses with an open request body.
+
 # h2-forked 0.4.20
 
 * Publish the fork as `h2-forked`, retaining the `h2` library name and async APIs.
