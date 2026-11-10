@@ -1,4 +1,4 @@
-# Unreleased
+# h2-forked 0.4.22
 
 * Share one Sans-I/O ready-stream queue between decoding and event delivery.
   Coalesce adjacent notifications for the same stream, including across drives,

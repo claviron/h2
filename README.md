@@ -19,7 +19,7 @@ Enable the `sans-io` feature, keeping `h2` as the dependency name:
 
 ```toml
 [dependencies]
-h2 = { package = "h2-forked", version = "0.4.21", features = ["sans-io"] }
+h2 = { package = "h2-forked", version = "0.4.22", features = ["sans-io"] }
 ```
 
 ## Sans-I/O client
@@ -73,7 +73,7 @@ The existing async APIs remain available without enabling `sans-io`:
 
 ```toml
 [dependencies]
-h2 = { package = "h2-forked", version = "0.4.21" }
+h2 = { package = "h2-forked", version = "0.4.22" }
 ```
 
 The existing `h2::client::handshake` and `h2::server::handshake` APIs accept an
