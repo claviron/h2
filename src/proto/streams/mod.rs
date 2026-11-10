@@ -13,7 +13,7 @@ mod streams;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 #[cfg(feature = "sans-io")]
-pub(crate) use self::recv::ResponseHead;
+pub(crate) use self::recv::{ResponseBody, ResponseHead};
 pub(crate) use self::send::PollReset;
 pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamRef, Streams};
 

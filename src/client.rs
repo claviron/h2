@@ -1516,22 +1516,6 @@ impl Future for ResponseFuture {
 }
 
 impl ResponseFuture {
-    #[cfg(feature = "sans-io")]
-    fn poll_response_head(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<proto::ResponseHead<RecvStream>, crate::Error>> {
-        match ready!(self.inner.poll_response_head(cx))? {
-            proto::ResponseHead::Informational(response) => {
-                Poll::Ready(Ok(proto::ResponseHead::Informational(response)))
-            }
-            proto::ResponseHead::Final(response) => {
-                let body = RecvStream::new(FlowControl::new(self.inner.clone()));
-                Poll::Ready(Ok(proto::ResponseHead::Final(response.map(|()| body))))
-            }
-        }
-    }
-
     /// Returns the stream ID of the response stream.
     ///
     /// # Panics

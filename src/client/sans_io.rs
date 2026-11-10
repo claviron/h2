@@ -13,14 +13,14 @@
 //! stream creation.
 use super::{Builder, Peer, ResponseFuture, SendRequest};
 use crate::codec::{raw::Raw, FrameIo, UserError};
-use crate::{proto, Error, Reason, RecvStream, SendStream, StreamId};
+use crate::{proto, Error, Reason, SendStream, StreamId};
 use bytes::{Bytes, BytesMut};
 use fnv::FnvHashMap;
 use http::{HeaderMap, Request, Response};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
 
 /// A received response event. DATA capacity is released explicitly.
@@ -64,13 +64,71 @@ pub enum Event {
 }
 
 #[derive(Debug)]
-enum Receiving {
-    Head(ResponseFuture),
-    Body(RecvStream),
+enum ReceivePhase {
+    Head,
+    Body,
+}
+
+/// Retains the response's existing reference through headers, body and credit.
+#[derive(Debug)]
+struct ReceiveCursor {
+    inner: proto::OpaqueStreamRef,
+    phase: ReceivePhase,
+}
+
+impl ReceiveCursor {
+    fn new(response: ResponseFuture) -> Self {
+        Self {
+            inner: response.inner,
+            phase: ReceivePhase::Head,
+        }
+    }
+
+    fn poll_next(&mut self, stream: StreamId, cx: &Context<'_>) -> Poll<Result<Event, Error>> {
+        match self.phase {
+            ReceivePhase::Head => match ready!(self.inner.poll_response_head(cx))? {
+                proto::ResponseHead::Informational(response) => {
+                    Poll::Ready(Ok(Event::Informational { stream, response }))
+                }
+                proto::ResponseHead::Final(response) => {
+                    self.phase = ReceivePhase::Body;
+                    Poll::Ready(Ok(Event::Headers { stream, response }))
+                }
+            },
+            ReceivePhase::Body => match ready!(self.inner.poll_response_body(cx))? {
+                proto::ResponseBody::Data(bytes) => Poll::Ready(Ok(Event::Data { stream, bytes })),
+                proto::ResponseBody::End(trailers) => {
+                    Poll::Ready(Ok(Event::End { stream, trailers }))
+                }
+            },
+        }
+    }
+
+    fn release_capacity(&mut self, count: usize) -> Result<(), Error> {
+        if matches!(self.phase, ReceivePhase::Head) {
+            return Ok(());
+        }
+        if count > proto::MAX_WINDOW_SIZE as usize {
+            return Err(UserError::ReleaseCapacityTooBig.into());
+        }
+        self.inner
+            .release_capacity(count as proto::WindowSize)
+            .map_err(Into::into)
+    }
+}
+
+impl Drop for ReceiveCursor {
+    fn drop(&mut self) {
+        // Before final headers, keep ResponseFuture's drop behavior. Afterwards,
+        // discard unread DATA as RecvStream did, then release the owned reference.
+        if matches!(self.phase, ReceivePhase::Body) {
+            self.inner.clear_recv_buffer();
+        }
+    }
 }
 #[derive(Debug)]
 struct Exchange {
-    receiving: Receiving,
+    receiving: ReceiveCursor,
     send: SendStream<Bytes>,
     unconsumed: usize,
     done: bool,
@@ -225,7 +283,7 @@ impl Session {
         self.exchanges.insert(
             id.as_u32(),
             Exchange {
-                receiving: Receiving::Head(response),
+                receiving: ReceiveCursor::new(response),
                 send,
                 unconsumed: 0,
                 done: false,
@@ -285,9 +343,7 @@ impl Session {
         if count > exchange.unconsumed {
             return Err(UserError::ReleaseCapacityTooBig.into());
         }
-        if let Receiving::Body(body) = &mut exchange.receiving {
-            body.flow_control().release_capacity(count)?;
-        }
+        exchange.receiving.release_capacity(count)?;
         exchange.unconsumed -= count;
         // The body handle remains until credit has been returned, even after End.
         if exchange.unconsumed == 0 && exchange.done && exchange.sent {
@@ -344,38 +400,16 @@ impl Session {
                 continue;
             }
             let stream = StreamId::from_internal(id.into());
-            let mut cx = Context::from_waker(&self.waker);
-            let event = match &mut exchange.receiving {
-                Receiving::Head(response) => match response.poll_response_head(&mut cx) {
-                    std::task::Poll::Ready(Ok(proto::ResponseHead::Informational(response))) => {
-                        Some(Ok(Event::Informational { stream, response }))
-                    }
-                    std::task::Poll::Ready(Ok(proto::ResponseHead::Final(response))) => {
-                        let (head, body) = response.into_parts();
-                        exchange.receiving = Receiving::Body(body);
-                        Some(Ok(Event::Headers {
-                            stream,
-                            response: Response::from_parts(head, ()),
-                        }))
-                    }
-                    std::task::Poll::Ready(Err(error)) => Some(Err(error)),
-                    std::task::Poll::Pending => None,
-                },
-                Receiving::Body(body) => match body.poll_data(&mut cx) {
-                    std::task::Poll::Ready(Some(Ok(bytes))) => {
+            let cx = Context::from_waker(&self.waker);
+            let event = match exchange.receiving.poll_next(stream, &cx) {
+                Poll::Ready(Ok(event)) => {
+                    if let Event::Data { bytes, .. } = &event {
                         exchange.unconsumed += bytes.len();
-                        Some(Ok(Event::Data { stream, bytes }))
                     }
-                    std::task::Poll::Ready(Some(Err(error))) => Some(Err(error)),
-                    std::task::Poll::Pending => None,
-                    std::task::Poll::Ready(None) => match body.poll_trailers(&mut cx) {
-                        std::task::Poll::Ready(Ok(trailers)) => {
-                            Some(Ok(Event::End { stream, trailers }))
-                        }
-                        std::task::Poll::Ready(Err(error)) => Some(Err(error)),
-                        std::task::Poll::Pending => None,
-                    },
-                },
+                    Some(Ok(event))
+                }
+                Poll::Ready(Err(error)) => Some(Err(error)),
+                Poll::Pending => None,
             };
             match event {
                 Some(Ok(event)) => {
@@ -450,7 +484,10 @@ mod tests {
         }
     }
     fn ready(limit: u32) -> Session {
-        let mut session = Session::new(Builder::new(), Instant::now());
+        ready_with_builder(limit, Builder::new())
+    }
+    fn ready_with_builder(limit: u32, builder: Builder) -> Session {
+        let mut session = Session::new(builder, Instant::now());
         assert!(!session.is_ready());
         let output = drain(&mut session);
         assert!(output.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
@@ -523,6 +560,195 @@ mod tests {
         assert!(!session.exchanges.contains_key(&id.as_u32()));
         assert!(session.can_open());
         drain(&mut session);
+    }
+
+    #[test]
+    fn pending_cursor_wakes_for_data_trailers_and_reset() {
+        #[derive(Clone, Copy)]
+        enum Arrival {
+            Data,
+            Trailers,
+            Reset,
+        }
+        for arrival in [Arrival::Data, Arrival::Trailers, Arrival::Reset] {
+            let mut session = ready(1);
+            let id = open(&mut session, true);
+            drain(&mut session);
+            session.input().extend_from_slice(&headers(id, false));
+            session.drive(session.now).unwrap();
+            assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+            assert!(session.next_event().is_none());
+
+            let progress = Arc::new(Progress::default());
+            let waker = Waker::from(progress.clone());
+            let cx = Context::from_waker(&waker);
+            assert!(session
+                .exchanges
+                .get_mut(&id.as_u32())
+                .unwrap()
+                .receiving
+                .poll_next(id, &cx)
+                .is_pending());
+            assert!(!progress.0.load(Ordering::Relaxed));
+
+            let input = match arrival {
+                Arrival::Data => {
+                    let mut data = frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ok"));
+                    data.set_end_stream(true);
+                    wire(data.into())
+                }
+                Arrival::Trailers => {
+                    let mut fields = HeaderMap::new();
+                    fields.insert("x-finished", http::HeaderValue::from_static("yes"));
+                    wire(frame::Headers::trailers(id.as_u32().into(), fields).into())
+                }
+                Arrival::Reset => {
+                    wire(frame::Reset::new(id.as_u32().into(), Reason::CANCEL).into())
+                }
+            };
+            session.input().extend_from_slice(&input);
+            session.drive(session.now).unwrap();
+            assert!(progress.0.load(Ordering::Relaxed));
+            match arrival {
+                Arrival::Data => {
+                    assert!(matches!(session.next_event(),
+                        Some(Event::Data { stream, bytes }) if stream == id && bytes == "ok"));
+                    assert!(matches!(session.next_event(),
+                        Some(Event::End { stream, trailers: None }) if stream == id));
+                    assert!(session.exchanges.contains_key(&id.as_u32()));
+                    session.release_capacity(id, 2).unwrap();
+                }
+                Arrival::Trailers => {
+                    assert!(matches!(session.next_event(),
+                        Some(Event::End { stream, trailers: Some(fields) })
+                        if stream == id && fields["x-finished"] == "yes"));
+                }
+                Arrival::Reset => {
+                    assert!(matches!(session.next_event(),
+                        Some(Event::Failed { stream, error })
+                        if stream == id && error.reason() == Some(Reason::CANCEL)));
+                }
+            }
+            assert!(session.next_event().is_none());
+            assert!(!session.exchanges.contains_key(&id.as_u32()));
+        }
+    }
+
+    #[test]
+    fn cursor_keeps_credit_and_send_half_after_early_response_end() {
+        let mut session = ready(1);
+        let id = open(&mut session, false);
+        session.release_capacity(id, 0).unwrap();
+        drain(&mut session);
+        let mut data = frame::Data::new(id.as_u32().into(), Bytes::from_static(b"ok"));
+        data.set_end_stream(true);
+        session.input().extend_from_slice(&headers(id, false));
+        session.input().extend_from_slice(&wire(data.into()));
+        session.drive(session.now).unwrap();
+        assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+        assert!(matches!(session.next_event(), Some(Event::Data { .. })));
+        assert!(matches!(session.next_event(), Some(Event::End { .. })));
+        assert_eq!(session.active, 1);
+        session.release_capacity(id, 1).unwrap();
+        assert!(session.release_capacity(id, 2).is_err());
+        assert_eq!(session.exchanges[&id.as_u32()].unconsumed, 1);
+        session.release_capacity(id, 1).unwrap();
+        assert!(session.exchanges.contains_key(&id.as_u32()));
+        session.send_data(id, Bytes::new(), true).unwrap();
+        assert_eq!(session.active, 0);
+        assert!(!session.exchanges.contains_key(&id.as_u32()));
+        drain(&mut session);
+        assert!(session.can_open());
+    }
+
+    #[test]
+    fn cursor_reset_restores_data_frame_budget_before_or_after_consumption() {
+        for (read_head, read_data) in [(false, false), (true, false), (true, true)] {
+            let mut builder = Builder::new();
+            // Enough for one small DATA frame, not two retained together.
+            builder.data_frame_budget(proto::DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
+            let mut session = ready_with_builder(2, builder);
+            let first = open(&mut session, true);
+            let second = open(&mut session, true);
+            drain(&mut session);
+            session.input().extend_from_slice(&headers(first, false));
+            session.input().extend_from_slice(&wire(
+                frame::Data::new(first.as_u32().into(), Bytes::from_static(b"a")).into(),
+            ));
+            session.drive(session.now).unwrap();
+            if read_head {
+                assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+            }
+            if read_data {
+                assert!(matches!(session.next_event(), Some(Event::Data { .. })));
+                // Reset must also reclaim delivered but uncredited bytes.
+                assert_eq!(session.exchanges[&first.as_u32()].unconsumed, 1);
+            }
+            session.reset(first, Reason::CANCEL);
+
+            session.input().extend_from_slice(&headers(second, false));
+            let mut data = frame::Data::new(second.as_u32().into(), Bytes::from_static(b"b"));
+            data.set_end_stream(true);
+            session.input().extend_from_slice(&wire(data.into()));
+            session.drive(session.now).unwrap();
+            assert!(matches!(session.next_event(),
+                Some(Event::Headers { stream, .. }) if stream == second));
+            assert!(matches!(session.next_event(),
+                Some(Event::Data { stream, bytes }) if stream == second && bytes == "b"));
+            assert!(matches!(session.next_event(),
+                Some(Event::End { stream, .. }) if stream == second));
+            session.release_capacity(second, 1).unwrap();
+            assert!(session.next_event().is_none());
+            drain(&mut session);
+        }
+    }
+
+    #[test]
+    fn cursor_drop_returns_unread_credit_but_keeps_delivered_credit_until_last_ref() {
+        for read_data in [false, true] {
+            let mut session = ready(1);
+            let id = open(&mut session, false);
+            drain(&mut session);
+            // Clear SendRequest's pending-open reference after the request is
+            // on the wire, leaving just the cursor and the send half.
+            let mut cx = Context::from_waker(&session.waker);
+            assert!(matches!(
+                session.send.poll_ready(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            let chunk = Bytes::from(vec![b'x'; frame::DEFAULT_MAX_FRAME_SIZE as usize]);
+            let credit = chunk.len() as u32 * 3;
+            session.input().extend_from_slice(&headers(id, false));
+            for _ in 0..3 {
+                session.input().extend_from_slice(&wire(
+                    frame::Data::new(id.as_u32().into(), chunk.clone()).into(),
+                ));
+            }
+            session.drive(session.now).unwrap();
+            assert!(matches!(session.next_event(), Some(Event::Headers { .. })));
+            if read_data {
+                for _ in 0..3 {
+                    assert!(matches!(session.next_event(), Some(Event::Data { .. })));
+                }
+            }
+            let Exchange {
+                receiving, send, ..
+            } = session.exchanges.remove(&id.as_u32()).unwrap();
+            drop(receiving);
+            let update = wire(frame::WindowUpdate::new(frame::StreamId::ZERO, credit).into());
+            let output = drain(&mut session);
+            let returned = output.windows(update.len()).any(|bytes| bytes == update);
+            // Unread buffers are returned eagerly. Delivered, uncredited bytes
+            // remain charged while the send half still keeps the stream alive.
+            assert_eq!(returned, !read_data);
+            drop(send);
+            let output = drain(&mut session);
+            if read_data {
+                assert!(output.windows(update.len()).any(|bytes| bytes == update));
+            } else {
+                assert!(!output.windows(update.len()).any(|bytes| bytes == update));
+            }
+        }
     }
 
     #[test]
@@ -662,13 +888,14 @@ mod tests {
             drain(&mut session);
             let progress = Arc::new(Progress::default());
             let waker = Waker::from(progress.clone());
-            let mut cx = Context::from_waker(&waker);
-            match &mut session.exchanges.get_mut(&id.as_u32()).unwrap().receiving {
-                Receiving::Head(response) => {
-                    assert!(response.poll_response_head(&mut cx).is_pending());
-                }
-                _ => panic!("request must still be waiting for headers"),
-            }
+            let cx = Context::from_waker(&waker);
+            assert!(session
+                .exchanges
+                .get_mut(&id.as_u32())
+                .unwrap()
+                .receiving
+                .poll_next(id, &cx)
+                .is_pending());
             assert!(!progress.0.load(Ordering::Relaxed));
 
             let input = if reset {

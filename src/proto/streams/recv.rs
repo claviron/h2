@@ -72,9 +72,16 @@ pub(super) enum Event {
 
 #[cfg(feature = "sans-io")]
 #[derive(Debug)]
-pub(crate) enum ResponseHead<B> {
+pub(crate) enum ResponseHead {
     Informational(Response<()>),
-    Final(Response<B>),
+    Final(Response<()>),
+}
+
+#[cfg(feature = "sans-io")]
+#[derive(Debug)]
+pub(crate) enum ResponseBody {
+    Data(Bytes),
+    End(Option<HeaderMap>),
 }
 
 #[derive(Debug)]
@@ -391,7 +398,7 @@ impl Recv {
         &mut self,
         cx: &Context,
         stream: &mut store::Ptr,
-    ) -> Poll<Result<ResponseHead<()>, proto::Error>> {
+    ) -> Poll<Result<ResponseHead, proto::Error>> {
         use super::peer::PollMessage::Client;
 
         match stream.pending_recv.pop_front(&mut self.buffer) {
@@ -1287,6 +1294,29 @@ impl Recv {
                 Poll::Ready(None)
             }
             None => self.schedule_recv(cx, stream),
+        }
+    }
+
+    /// The cursor owns both DATA and trailers, so neither needs to be put back.
+    #[cfg(feature = "sans-io")]
+    pub fn poll_response_body(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+        counts: &mut Counts,
+    ) -> Poll<Result<ResponseBody, proto::Error>> {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Data(data)) => {
+                if data.is_budgeted {
+                    counts.release_data_frame(data.payload.len());
+                }
+                Poll::Ready(Ok(ResponseBody::Data(data.payload)))
+            }
+            Some(Event::Trailers(trailers)) => Poll::Ready(Ok(ResponseBody::End(Some(trailers)))),
+            Some(_) => panic!("poll_response_body called before final response headers"),
+            None => self
+                .schedule_recv(cx, stream)
+                .map(|result| result.unwrap_or(Ok(ResponseBody::End(None)))),
         }
     }
 
