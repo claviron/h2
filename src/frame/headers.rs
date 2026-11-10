@@ -992,12 +992,12 @@ impl HeaderBlock {
     fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
         let mut hpack = encoder.take_scratch();
         hpack.clear();
-        let headers = Iter {
+        let mut headers = Iter {
             pseudo: Some(self.pseudo),
             fields: self.fields.into_iter(),
         };
 
-        encoder.encode(headers, &mut hpack);
+        encoder.encode(&mut headers, &mut hpack);
 
         EncodingHeaderBlock { hpack }
     }
